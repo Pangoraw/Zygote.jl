@@ -7,8 +7,6 @@ using IRTools: IR, Variable, Pipe, xcall, var, prewalk, postwalk,
 @inline tuple_va(N, x, xs...) = (x, tuple_va(N, xs...)...)
 @inline tuple_va(::Val{N}, ::Nothing) where N = ntuple(_ -> nothing, Val(N))
 
-iscall(x, m::Module, n::Symbol) = isexpr(x, :call) && x.args[1] == GlobalRef(m, n)
-
 gradindex(x, i) = x[i]
 gradindex(::Nothing, i) = nothing
 xgetindex(x, i...) = xcall(Base, :getindex, x, i...)
@@ -26,19 +24,24 @@ end
 unwrapquote(x) = x
 unwrapquote(x::QuoteNode) = x.value
 
-is_getproperty(ex) = iscall(ex, Base, :getproperty)
-
 # Allows us to resolve constants which have been stored in Variables.
 # e.g. `%1 = 1; %2 = %1``, or `%1 = identity; %1(...)`.
+# Also resolves any `GlobalRef` to its underlying value if it is const.
 trylookup(ir::IR, @nospecialize(v)) = v
 trylookup(ir::IR, v::Variable) = haskey(ir, v) ? trylookup(ir, ir[v].expr) : v
-# Only resolve GlobalRefs to traverse module hierarchies
+
 function trylookup(ir::IR, ref::GlobalRef)
   isconst(ref.mod, ref.name) || return ref
-  val = getproperty(ref.mod, ref.name)
-  return val isa Module ? val : ref
+  return getproperty(ref.mod, ref.name)
 end
 
+function iscall(ir::IR, v::Variable, f)
+  haskey(ir, v) || return false
+  ex = ir[v].expr
+  Meta.isexpr(ex, :call) || return false
+  fex = trylookup(ir, ex.args[1])
+  fex === f
+end
 
 # The initial premise of literal_getproperty was in some ways inherently flawed, because for
 # getproperty it was intended that _pullback falls back to literal_getproperty, but we actually
@@ -48,12 +51,12 @@ end
 # now always instrument getproperty as literal_getproperty, no matter whether the second
 # argument is a literal or not.
 function instrument_getproperty!(ir::Pipe, v, ex)
-  func = trylookup(ir.from, ex.args[1])
-  if func == GlobalRef(Base, :getproperty) && length(ex.args) >= 3
+  if iscall(ir.from, v, Base.getproperty) && length(ex.args) >= 3
     obj, prop = ex.args[2], trylookup(ir.from, ex.args[3])
     original = trylookup(ir.from, obj)
     if original isa Module && prop isa QuoteNode && isconst(original, unwrapquote(prop))
       # Metaprogramming can generate getproperty(::Module, ...) calls.
+
       # Like other types, these are type unstable without constprop.
       # However, literal_getproperty's heuristic is also not general enough for modules.
       # Thankfully, we can skip instrumenting these if they're const properties.
@@ -70,12 +73,11 @@ function instrument_getproperty!(ir::Pipe, v, ex)
   end
 end
 
-
 # Here, only instrumenting getfield with literals is fine, since users should never have to
 # define custom adjoints for literal_getfield
 function instrument_getfield!(ir, v, ex)
   func = trylookup(ir.from, ex.args[1])
-  if func == GlobalRef(Core, :getfield) || func == GlobalRef(Base, :getfield)
+  if func === Core.getfield
     obj, field = ex.args[2], trylookup(ir.from, ex.args[3])
     if field isa Union{QuoteNode,Integer}
       call = xcall(Zygote, :literal_getfield, obj, Val(unwrapquote(field)))
@@ -88,7 +90,7 @@ end
 # TODO: is this always correct for user defined getindex methods?
 function instrument_getindex!(ir, v, ex)
   func = trylookup(ir.from, ex.args[1])
-  if func == GlobalRef(Base, :getindex) && length(ex.args) == 3
+  if func === Base.getindex && length(ex.args) == 3
     obj, idx = ex.args[2], trylookup(ir.from, ex.args[3])
     if idx isa Union{QuoteNode,Integer}
       call = xcall(Zygote, :literal_getindex, obj, Val(unwrapquote(idx)))
@@ -99,8 +101,7 @@ function instrument_getindex!(ir, v, ex)
 end
 
 function instrument_iterate!(ir, v, ex)
-  func = ex.args[1]
-  if func == GlobalRef(Base, :indexed_iterate) && length(ex.args) >= 3
+  if iscall(ir.from, v, Base.indexed_iterate) && length(ex.args) >= 3
     obj, idx, rest = ex.args[2], trylookup(ir.from, ex.args[3]), ex.args[4:end]
     if idx isa Union{QuoteNode,Integer}
       call = xcall(Zygote, :literal_indexed_iterate, obj, Val(unwrapquote(idx)), rest...)
@@ -120,7 +121,7 @@ end
 
 function istrackable(x)
   x isa GlobalRef && x.mod ∉ (Base, Core) || return false
-  isconst(x.mod, x.name) || return true
+  isconst(x) || return true
   x = getfield(x.mod, x.name)
   !(x isa Type || sizeof(x) == 0)
 end
@@ -182,22 +183,30 @@ function record_branches!(ir::IR)
   return ir, brs
 end
 
-ignored_f(f) = f in (GlobalRef(Base, :not_int),
-                     GlobalRef(Core.Intrinsics, :not_int),
-                     GlobalRef(Core, :(===)),
-                     GlobalRef(Core, :apply_type),
-                     GlobalRef(Core, :typeof),
-                     GlobalRef(Core, :throw),
-                     GlobalRef(Base, :kwerr),
-                     GlobalRef(Core, :kwfunc),
-                     GlobalRef(Core, :isdefined))
-ignored_f(ir, f) = ignored_f(f)
-ignored_f(ir, f::Variable) = ignored_f(get(ir, f, nothing))
+function ignored_f(f::GlobalRef)
+  # isconst(::GlobalRef) will resolve the binding for f in f.mod
+  # which is an acceptable side effect during compilation
+  # anyway. This means that we can rely on the result of
+  # getfield(f.mod, f.name) for the rest of the analysis.
+  # See https://github.com/JuliaLang/julia/issues/44604.
+  isconst(f) || return false
+
+  f = getfield(f.mod, f.name)
+  ignored_f(f)
+end
+function ignored_f(@nospecialize(f))
+  f ∈ (Core.Intrinsics.not_int,
+       Core.:(===),
+       Core.apply_type,
+       Core.typeof,
+       Core.throw,
+       Core.isdefined)
+end
 
 function ignored(ir, ex)
   f = trylookup(ir, ex.args[1])
-  ignored_f(ir, f) && return true
-  if f == GlobalRef(Base, :getproperty) && length(ex.args) >= 3
+  ignored_f(f) && return true
+  if f === Base.getproperty && length(ex.args) >= 3
     obj, prop = trylookup(ir, ex.args[2]), trylookup(ir, ex.args[3])
     # Metaprogramming can generate getproperty(::Module, ...) calls.
     # These are type unstable without constprop, which transforming to _pullback breaks.
@@ -206,7 +215,6 @@ function ignored(ir, ex)
   end
   return false
 end
-ignored(ir, ex::Variable) = ignored(ir, ir[ex])
 
 function primal(ir::IR)
   pr = Pipe(ir)

@@ -65,7 +65,17 @@ if VERSION >= v"1.4.0-DEV.304"
     _pushforward((first(args), tail(tail(dargs))...), Core._apply, f, args...)
 end
 
-using ..Zygote: literal_getproperty, literal_getfield, literal_getindex
+using ..Zygote: literal_getproperty, literal_getfield, literal_getindex, literal_indexed_iterate
+
+# Generic fallback to getproperty for !(T <: NamedTuple)
+_pushforward(dargs, ::typeof(literal_getproperty), x, ::Val{property_name}) where {property_name} =
+  _pushforward(dargs, getproperty, x, property_name)
+
+_pushforward(dargs, ::typeof(literal_indexed_iterate), x, ::Val{property_name}, st) where {property_name} =
+  _pushforward(dargs, Base.indexed_iterate, x, property_name, st) 
+
+_pushforward(dargs, ::typeof(literal_indexed_iterate), x, ::Val{property_name}) where {property_name} =
+  _pushforward(dargs, Base.indexed_iterate, x, property_name) 
 
 function _pushforward(dargs, ::typeof(literal_getproperty), x::NamedTuple,
                       ::Val{property_name}) where {property_name}

@@ -1,5 +1,6 @@
 using Zygote, Test
 using Zygote: pullback, @adjoint, Context
+import IRTools
 
 macro test_inferred(ex)
   :(let res = nothing
@@ -227,3 +228,17 @@ end
 
 # issue 897
 @test gradient(x -> sum(norm, collect(eachcol(x))), ones(3, 400))[1] ≈ fill(0.5773502691896258, 3, 400)
+
+import Core: throw as throw_alias
+f_throws() = throw_alias("error")
+
+@testset "ignore throw calls" begin
+  adj = @code_adjoint f_throws()
+  throw_call = last(first(IRTools.block(adj.primal, 1))).expr
+  @test Meta.isexpr(throw_call, :call, 2)
+
+  th = throw_call.args[1]
+  @test th isa GlobalRef
+  @test isconst(th)
+  @test getfield(th.mod, th.name) === Core.throw # makes sur that there is no pullback for Core.throw
+end

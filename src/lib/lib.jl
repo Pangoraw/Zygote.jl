@@ -153,6 +153,12 @@ function _pullback(cx::AContext, ::typeof(literal_indexed_iterate), xs::Tuple, :
   back(ȳ) = (b(ȳ[1])..., nothing)
   (y, i+1), back
 end
+function _pullback(cx::AContext, ::typeof(literal_indexed_iterate), xs, ::Val{i}, st) where i
+  _pullback(cx, Base.indexed_iterate, xs, i, st)
+end
+function _pullback(cx::AContext, ::typeof(literal_indexed_iterate), xs, ::Val{i}) where i
+  _pullback(cx, Base.indexed_iterate, xs, i)
+end
 
 # Needed for iteration lowering
 @adjoint Core.getfield(xs::NTuple{N,Any}, i::Int) where N =
@@ -260,6 +266,11 @@ end
 function _pullback(cx::AContext, ::typeof(literal_getfield), x::Tuple,
                    ::Val{index}) where {index}
   return _pullback(cx, literal_getindex, x, Val(index))
+end
+
+# Generic literal_getindex fallback to getindex. See lib/base.jl
+function _pullback(cx::AContext, ::typeof(literal_getindex), x, ::Val{key}) where {key}
+  return _pullback(cx, getindex, x, key)
 end
 
 grad_mut(x) = Ref{Any}(nt_nothing(x))
